@@ -391,6 +391,32 @@ test_search_author_filter() {
   assert_contains "carol" "search filtered to carol"
 }
 
+test_search_from_modifier() {
+  echo -e "\n${BOLD}search from: modifier${RESET}"
+
+  run_slackslaw search "from:carol deploy" --json
+  assert_exit 0 "search from:carol deploy exits 0"
+  assert_contains "carol" "from:carol finds carol messages"
+  assert_contains "deploy" "from:carol deploy matches deploy text"
+
+  run_slackslaw search "author:bob Hey" --json
+  assert_exit 0 "search author:bob exits 0"
+  assert_contains "bob" "author:bob finds bob messages"
+
+  run_slackslaw search "from:dave" --json
+  assert_exit 0 "search from:dave (no keywords) exits 0"
+  assert_contains "dave" "from:dave finds dave messages without keywords"
+}
+
+test_search_in_modifier() {
+  echo -e "\n${BOLD}search in: modifier${RESET}"
+
+  run_slackslaw search "in:ops incident" --json
+  assert_exit 0 "search in:ops exits 0"
+  assert_contains "ops" "in:ops filters to ops channel"
+  assert_contains "incident" "in:ops incident finds incident text"
+}
+
 test_search_limit() {
   echo -e "\n${BOLD}search --limit${RESET}"
 
@@ -538,6 +564,32 @@ test_sql_select_users() {
   assert_contains "bob" "sql returns bob"
   assert_contains "carol" "sql returns carol"
   assert_contains "dave" "sql returns dave"
+}
+
+test_sql_normalize_legacy_names() {
+  echo -e "\n${BOLD}sql (legacy name normalization)${RESET}"
+
+  run_slackslaw sql "SELECT COUNT(*) FROM USER;"
+  assert_exit 0 "sql USER alias exits 0"
+  assert_contains "4" "USER alias maps to S_USER"
+}
+
+test_sql_workspace_flag() {
+  echo -e "\n${BOLD}sql --workspace${RESET}"
+
+  run_slackslaw sql "SELECT COUNT(*) FROM MESSAGE;" --workspace "$TEST_WS"
+  assert_exit 0 "sql --workspace exits 0"
+  assert_contains "11" "sql --workspace returns message count"
+}
+
+test_schema() {
+  echo -e "\n${BOLD}schema${RESET}"
+
+  run_slackslaw schema --workspace "$TEST_WS"
+  assert_exit 0 "schema exits 0"
+  assert_contains "MESSAGE" "schema mentions MESSAGE table"
+  assert_contains "S_USER" "schema mentions S_USER table"
+  assert_contains "from:jason.tunstall" "schema documents inline author search"
 }
 
 test_sql_stdin() {

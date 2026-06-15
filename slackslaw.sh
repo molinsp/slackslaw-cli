@@ -12,6 +12,8 @@
 #   slackslaw sync --full                   # full archive of all workspaces
 #   slackslaw sync                          # incremental sync (new msgs only)
 #   slackslaw sync --channel "#ops"         # sync a single channel
+#   slackslaw sync -c general,ops,eng       # sync multiple channels (comma-sep)
+#   slackslaw sync --filter-channels <path>       # full sync, but filter channels via file (DMs still included)
 #   slackslaw sync --since 30d              # time-bounded sync
 #   slackslaw sync --quiet                  # cron-friendly (silent on success)
 #   slackslaw whatsnew                      # print msgs since last sync
@@ -467,6 +469,13 @@ workspace_dir() {
   echo "$WORKSPACES_DIR/$short"
 }
 
+# slackdump tracks workspaces by the short team name (e.g. "dialecticanet"),
+# NOT the .slack.com form. We store the canonical .slack.com name in our
+# config for display, but must strip it when invoking slackdump.
+slackdump_ws() {
+  echo "${1%.slack.com}"
+}
+
 # slackdump writes the SQLite file inside the output directory.
 # The filename varies by version — discover it at runtime.
 find_workspace_db() {
@@ -516,6 +525,88 @@ probe_user_expr() {
   fi
 }
 
+# Extract inline search modifiers (from:, author:, in:, channel:) from a query string.
+# Prints JSON: {"query":"...", "author":"...", "channel":"..."}
+parse_search_modifiers() {
+  python3 - "$1" <<'PYEOF'
+import json, re, sys
+
+query = sys.argv[1]
+author = ""
+channel = ""
+
+for m in re.finditer(r'(?:^|\s)(?:from|author):@?"?([\w.-]+)"?', query, re.I):
+    if not author:
+        author = m.group(1)
+
+for m in re.finditer(r'(?:^|\s)(?:in|channel):#?"?([\w.-]+)"?', query, re.I):
+    if not channel:
+        channel = m.group(1)
+
+clean = re.sub(r'(?:^|\s)(?:from|author):@?"?[\w.-]+"?', ' ', query, flags=re.I)
+clean = re.sub(r'(?:^|\s)(?:in|channel):#?"?[\w.-]+"?', ' ', clean, flags=re.I)
+clean = ' '.join(clean.split())
+
+print(json.dumps({"query": clean, "author": author, "channel": channel}))
+PYEOF
+}
+
+# Build SQL clause matching author by username, Slack name, or real name.
+build_author_clause() {
+  local db="$1" user_table="$2" author_filter="$3"
+  local escaped cols clause
+  escaped=$(echo "$author_filter" | sed "s/'/''/g")
+  cols=$(sqlite3 "$db" "PRAGMA table_info(${user_table});" 2>/dev/null || true)
+
+  clause="LOWER(COALESCE(u.USERNAME, '')) LIKE LOWER('%${escaped}%')"
+  if echo "$cols" | grep -qi '|DATA|'; then
+    clause+=" OR LOWER(COALESCE(json_extract(CAST(u.DATA AS TEXT), '\$.real_name'), '')) LIKE LOWER('%${escaped}%')"
+    clause+=" OR LOWER(COALESCE(json_extract(CAST(u.DATA AS TEXT), '\$.name'), '')) LIKE LOWER('%${escaped}%')"
+  fi
+  if echo "$cols" | grep -qi '|real_name|'; then
+    clause+=" OR LOWER(COALESCE(u.real_name, '')) LIKE LOWER('%${escaped}%')"
+  fi
+  if echo "$cols" | grep -qi '|name|'; then
+    clause+=" OR LOWER(COALESCE(u.name, '')) LIKE LOWER('%${escaped}%')"
+  fi
+  echo "(${clause})"
+}
+
+# Build deduplicated user subquery, including DATA when available (slackdump v4).
+build_user_dedup() {
+  local db="$1" user_table="$2"
+  local user_cols
+  user_cols=$(sqlite3 "$db" "PRAGMA table_info(${user_table});" 2>/dev/null || true)
+  if echo "$user_cols" | grep -qi '|USERNAME|'; then
+    if echo "$user_cols" | grep -qi '|DATA|'; then
+      echo "(SELECT ID, USERNAME, DATA FROM ${user_table} GROUP BY ID)"
+    else
+      echo "(SELECT ID, USERNAME FROM ${user_table} GROUP BY ID)"
+    fi
+  else
+    echo "(SELECT ID, real_name, name FROM ${user_table} GROUP BY ID)"
+  fi
+}
+
+# Rewrite common stale table/column names in hand-written SQL.
+normalize_sql() {
+  python3 -c "
+import re, sys
+sql = sys.stdin.read()
+replacements = [
+    (r'\\bSLACKUSER\\b', 'S_USER'),
+    (r'\\bUSER\\b', 'S_USER'),
+    (r'\\busers\\b', 'S_USER'),
+    (r'\\bm\\.TEXT\\b', 'm.TXT'),
+    (r'\\bMESSAGE\\.TEXT\\b', 'MESSAGE.TXT'),
+    (r'\\bmessage\\.text\\b', 'message.TXT'),
+]
+for pat, rep in replacements:
+    sql = re.sub(pat, rep, sql)
+print(sql, end='')
+"
+}
+
 # ── Commands ──────────────────────────────────────────────────────────────────
 
 cmd_auth() {
@@ -530,12 +621,13 @@ cmd_auth() {
     read -r ws_hint
   fi
 
-  # Normalise: strip protocol/path but keep .slack.com (slackdump v4 needs it)
-  local ws_name
-  ws_name=$(echo "$ws_hint" | sed 's|https\?://||; s|/.*||')
-  # Ensure it ends with .slack.com (slackdump v4 uses this as the workspace ID)
-  [[ "$ws_name" != *.slack.com ]] && ws_name="${ws_name}.slack.com"
-  [[ -z "$ws_name" || "$ws_name" == ".slack.com" ]] && die "Could not determine workspace name from: $ws_hint"
+  # Normalise: strip protocol/path. slackdump tracks the workspace by the short
+  # team name; we store the canonical .slack.com form in our config.
+  local ws_short
+  ws_short=$(echo "$ws_hint" | sed 's|https\?://||; s|/.*||')
+  ws_short="${ws_short%.slack.com}"
+  [[ -z "$ws_short" ]] && die "Could not determine workspace name from: $ws_hint"
+  local ws_name="${ws_short}.slack.com"
 
   mkdir -p "$(workspace_dir "$ws_name")"
 
@@ -545,7 +637,7 @@ cmd_auth() {
 
   # slackdump workspace new handles EZ-Login 3000 and stores credentials in
   # its own config (~/.config/slackdump/ or ~/.slackdump/).
-  slackdump workspace new "$ws_hint" \
+  slackdump workspace new "$ws_short" \
     || die "Authentication failed for $ws_name"
 
   record_workspace "$ws_name"
@@ -641,20 +733,45 @@ cmd_sync() {
   local full_sync=false
   local target_ws=""
   local channel_spec=""
+  local from_file=""
   local since_duration=""
   local quiet_mode=false
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --full)        full_sync=true ;;
-      --workspace)   shift; target_ws="$1" ;;
-      --channel|-c)  shift; channel_spec="${1#\#}" ;;
-      --since)       shift; since_duration="$1" ;;
-      --quiet|-q)    quiet_mode=true ;;
-      *)             warn "Unknown sync option: $1" ;;
+      --full)         full_sync=true ;;
+      --workspace)    shift; target_ws="$1" ;;
+      --channel|-c)   shift; channel_spec="$1" ;;
+      --filter-channels)    shift; from_file="$1" ;;
+      --since)        shift; since_duration="$1" ;;
+      --quiet|-q)     quiet_mode=true ;;
+      *)              warn "Unknown sync option: $1" ;;
     esac
     shift
   done
+
+  # ── Build channel list ───────────────────────────────────────────────────────
+  # Sources: --channel (comma-separated, # prefix stripped) + --filter-channels (one
+  # name per line, # for comments). slackdump accepts both names and IDs as
+  # positional args; we pass them through verbatim.
+  local -a channel_list=()
+  if [[ -n "$channel_spec" ]]; then
+    local IFS=','
+    for c in $channel_spec; do
+      c="${c#\#}"; c="${c// /}"
+      [[ -n "$c" ]] && channel_list+=("$c")
+    done
+  fi
+  if [[ -n "$from_file" ]]; then
+    [[ -f "$from_file" ]] || die "Channel file not found: $from_file"
+    while IFS= read -r line; do
+      line="${line%%#*}"                          # strip inline comment
+      line="${line#"${line%%[![:space:]]*}"}"     # ltrim
+      line="${line%"${line##*[![:space:]]}"}"     # rtrim
+      [[ -z "$line" ]] && continue
+      channel_list+=("${line#\#}")
+    done < "$from_file"
+  fi
 
   local workspaces
   if [[ -n "$target_ws" ]]; then
@@ -664,25 +781,28 @@ cmd_sync() {
   fi
   [[ -z "$workspaces" ]] && die "No workspaces configured. Run: slackslaw auth first."
 
-  # Build time-from flag for --since
+  # Build time-from flag for --since.
+  # slackdump v4's -time-from expects a date-only layout (YYYY-MM-DD); an
+  # RFC3339 string with a time/zone is rejected ("extra text: T..Z").
   local time_from_flag=""
   if [[ -n "$since_duration" ]]; then
     local since_ts
     since_ts=$(parse_duration_to_ts "$since_duration")
-    local since_rfc3339
-    since_rfc3339=$(python3 -c "
+    local since_date
+    since_date=$(python3 -c "
 from datetime import datetime, timezone
-print(datetime.fromtimestamp(${since_ts}, tz=timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'))
+print(datetime.fromtimestamp(${since_ts}, tz=timezone.utc).strftime('%Y-%m-%d'))
 ")
-    time_from_flag="-time-from ${since_rfc3339}"
+    time_from_flag="-time-from ${since_date}"
   fi
 
   while IFS= read -r ws; do
     [[ -z "$ws" ]] && continue
     $quiet_mode || header "Syncing workspace: $ws"
 
-    local ws_dir
+    local ws_dir ws_sd
     ws_dir=$(workspace_dir "$ws")
+    ws_sd=$(slackdump_ws "$ws")
     mkdir -p "$ws_dir"
 
     local last_sync
@@ -692,22 +812,69 @@ print(datetime.fromtimestamp(${since_ts}, tz=timezone.utc).strftime('%Y-%m-%dT%H
     local sync_start
     sync_start=$(date -u +%s)
 
-    # Resolve channel name → ID if channel_spec is given
-    local channel_id=""
-    if [[ -n "$channel_spec" ]]; then
-      local db
-      db=$(find_workspace_db "$ws_dir")
-      if [[ -n "$db" && -f "$db" ]]; then
-        local ch_table
-        ch_table=$(probe_table "$db" CHANNEL channels)
-        channel_id=$(sqlite3 "$db" \
-          "SELECT ID FROM ${ch_table} WHERE LOWER(NAME)=LOWER('${channel_spec}') LIMIT 1;" \
-          2>/dev/null || true)
+    # ── Resolve channel names → IDs ──────────────────────────────────────────
+    # slackdump archive accepts only IDs or Slack URLs as positional "links"
+    # (bare names fail with: "invalid link: <name>"). We resolve any name-form
+    # entries via `slackdump list channels -format CSV` (cached 20m).
+    # IDs (C*/D*/G*) and URLs pass through untouched.
+    local -a resolved_list=()
+    if (( ${#channel_list[@]} > 0 )); then
+      local need_lookup=false c
+      for c in "${channel_list[@]}"; do
+        if [[ ! "$c" =~ ^[CDG][A-Z0-9]{6,}$ ]] && [[ ! "$c" =~ ^https?:// ]]; then
+          need_lookup=true; break
+        fi
+      done
+      if $need_lookup; then
+        $quiet_mode || info "Resolving channel names → IDs via 'slackdump list channels' (cached 20m)…"
+        local resolved_str
+        resolved_str=$(slackdump list channels -workspace "$ws_sd" -format CSV -no-json -member-only 2>/dev/null \
+          | python3 - "${channel_list[@]}" <<'PYEOF'
+import csv, io, sys
+names = sys.argv[1:]
+reader = csv.reader(sys.stdin)
+rows = list(reader)
+if not rows:
+    sys.stderr.write("ERROR: empty channel list from slackdump\n"); sys.exit(1)
+header = [h.strip().lower() for h in rows[0]]
+def col(*candidates):
+    for c in candidates:
+        if c in header: return header.index(c)
+    return -1
+i_id   = col('id','channel_id')
+i_name = col('name','channel_name')
+if i_id < 0 or i_name < 0:
+    sys.stderr.write(f"ERROR: unexpected CSV header: {header}\n"); sys.exit(1)
+m = {}
+for r in rows[1:]:
+    if len(r) <= max(i_id, i_name): continue
+    n = r[i_name].strip().lstrip('#').lower()
+    i = r[i_id].strip()
+    if n and i: m[n] = i
+out, missing = [], []
+for n in names:
+    k = n.lstrip('#').lower()
+    if k in m: out.append(m[k])
+    else: missing.append(n); out.append(n)
+if missing:
+    sys.stderr.write(f"WARN: {len(missing)} channel(s) not found, passing verbatim: {', '.join(missing)}\n")
+print(' '.join(out))
+PYEOF
+)
+        [[ -z "$resolved_str" ]] && die "Channel resolution failed. Try: slackdump list channels -workspace $ws_sd"
+        resolved_list=($resolved_str)
+      else
+        resolved_list=("${channel_list[@]}")
       fi
-      if [[ -z "$channel_id" ]]; then
-        # Try using the spec directly as a channel ID
-        channel_id="$channel_spec"
-      fi
+    fi
+
+    # Build space-separated, shell-quoted list of channel positional args.
+    local channel_args=""
+    if (( ${#resolved_list[@]} > 0 )); then
+      local c
+      for c in "${resolved_list[@]}"; do
+        channel_args+=" \"$c\""
+      done
     fi
 
     # Build the slackdump command
@@ -720,35 +887,58 @@ print(datetime.fromtimestamp(${since_ts}, tz=timezone.utc).strftime('%Y-%m-%dT%H
 
     if $full_sync || [[ -z "$last_sync" ]]; then
       $quiet_mode || info "Full archive sync for ${ws}…"
+      if (( ${#channel_list[@]} > 0 )); then
+        if [[ -n "$from_file" ]]; then
+          $quiet_mode || info "  channels from file: ${#channel_list[@]} (DMs + group DMs still included via 2nd pass)"
+        else
+          $quiet_mode || info "  channel-subset mode: ${#channel_list[@]} channel(s) — DMs and other channels excluded"
+        fi
+      fi
       # ─────────────────────────────────────────────────────────────────────
       # slackdump v4: -workspace and -y are per-subcommand flags.
       # They go AFTER the subcommand name, not before it.
       #   slackdump archive -workspace <ws> -y -o <dir>   ← correct (v4)
       #   slackdump -w <ws> archive ...                   ← wrong (causes "flag not defined")
       # ─────────────────────────────────────────────────────────────────────
-      local cmd="slackdump archive -workspace \"$ws\" -y -o \"$ws_dir\""
+      local cmd="slackdump archive -workspace \"$ws_sd\" -y -o \"$ws_dir\""
       [[ -n "$time_from_flag" ]] && cmd+=" $time_from_flag"
-      [[ -n "$channel_id" ]] && cmd+=" \"$channel_id\""
+      cmd+="$channel_args"
       eval "$cmd $output_redirect" || {
           $quiet_mode || error "slackdump archive failed for '$ws'"
           $quiet_mode || error "Debug: try running manually:"
-          $quiet_mode || error "  slackdump archive -workspace $ws -y -o $ws_dir"
+          $quiet_mode || error "  slackdump archive -workspace $ws_sd -y -o $ws_dir"
           continue
         }
     else
       $quiet_mode || info "Incremental sync for ${ws} (since ${last_sync})…"
-      local cmd="slackdump resume -workspace \"$ws\" \"$ws_dir\""
+      local cmd="slackdump resume -workspace \"$ws_sd\" \"$ws_dir\""
       [[ -n "$time_from_flag" ]] && cmd+=" $time_from_flag"
-      [[ -n "$channel_id" ]] && cmd+=" \"$channel_id\""
+      cmd+="$channel_args"
       eval "$cmd $output_redirect" || {
           $quiet_mode || warn "resume failed for '$ws' — falling back to full archive…"
-          local cmd2="slackdump archive -workspace \"$ws\" -y -o \"$ws_dir\""
+          local cmd2="slackdump archive -workspace \"$ws_sd\" -y -o \"$ws_dir\""
           [[ -n "$time_from_flag" ]] && cmd2+=" $time_from_flag"
-          [[ -n "$channel_id" ]] && cmd2+=" \"$channel_id\""
+          cmd2+="$channel_args"
           eval "$cmd2 $output_redirect" || {
               $quiet_mode || error "archive also failed for '$ws'"
               continue
             }
+        }
+    fi
+
+    # ── DM pass (only when --filter-channels is used) ─────────────────────
+    # --filter-channels means "full sync, but filter channels via file".
+    # Since positional channel args to slackdump exclude DMs, we run a 2nd
+    # archive pass for -chan-types im,mpim. Writes into the same SQLite DB;
+    # messages dedupe via UPSERT.
+    # Bare -c name1,name2 stays restrictive (no DM pass) — that's the
+    # traditional "just this channel" semantic.
+    if [[ -n "$from_file" ]]; then
+      $quiet_mode || info "DM pass for ${ws} (-chan-types im,mpim)…"
+      local cmd_dm="slackdump archive -workspace \"$ws_sd\" -y -o \"$ws_dir\" -chan-types im,mpim"
+      [[ -n "$time_from_flag" ]] && cmd_dm+=" $time_from_flag"
+      eval "$cmd_dm $output_redirect" || {
+          $quiet_mode || error "DM pass failed for '$ws'"
         }
     fi
 
@@ -1065,7 +1255,20 @@ cmd_search() {
   done
 
   [[ -z "$query" ]] && die \
-    'Usage: slackslaw search "expr" [--channel C] [--author A] [--mine] [--newest-first] [--workspace W] [--limit N] [--json]'
+    'Usage: slackslaw search "expr" [--channel C] [--author A] [--mine] [--newest-first] [--workspace W] [--limit N] [--json]
+  Inline filters: from:USER  author:USER  in:CHANNEL  channel:CHANNEL'
+
+  # Parse inline modifiers (from:jason, in:#general) unless already set via flags
+  local parsed author_from_query channel_from_query
+  parsed=$(parse_search_modifiers "$query")
+  author_from_query=$(echo "$parsed" | python3 -c "import json,sys; print(json.load(sys.stdin).get('author',''))")
+  channel_from_query=$(echo "$parsed" | python3 -c "import json,sys; print(json.load(sys.stdin).get('channel',''))")
+  query=$(echo "$parsed" | python3 -c "import json,sys; print(json.load(sys.stdin).get('query',''))")
+  [[ -z "$author_filter" && -n "$author_from_query" ]] && author_filter="$author_from_query"
+  [[ -z "$channel_filter" && -n "$channel_from_query" ]] && channel_filter="${channel_from_query#\#}"
+
+  [[ -z "$query" && -z "$author_filter" && -z "$channel_filter" ]] && die \
+    'Search query is empty after removing modifiers. Provide keywords and/or from:USER / in:CHANNEL.'
 
   local workspaces
   if [[ -n "$target_ws" ]]; then
@@ -1117,21 +1320,18 @@ cmd_search() {
       "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%fts%' LIMIT 1;" \
       2>/dev/null || true)
 
-    # Escape single quotes in the query for SQL safety
-    local q_escaped
-    q_escaped=$(echo "$query" | sed "s/'/''/g")
-
     # Deduplicate channel/user tables (slackdump v4 stores multiple chunks)
     local ch_dedup="(SELECT ID, NAME FROM ${ch_table} GROUP BY ID)"
     local user_dedup
-    if echo "$user_cols" | grep -qi '|USERNAME|'; then
-      user_dedup="(SELECT ID, USERNAME FROM ${user_table} GROUP BY ID)"
-    else
-      user_dedup="(SELECT ID, real_name, name FROM ${user_table} GROUP BY ID)"
-    fi
+    user_dedup=$(build_user_dedup "$db" "$user_table")
+
+    # Escape single quotes in the query for SQL safety
+    local q_escaped author_escaped
+    q_escaped=$(echo "$query" | sed "s/'/''/g")
+    author_escaped=$(echo "$author_filter" | sed "s/'/''/g")
 
     local sql
-    if [[ -n "$fts_table" ]]; then
+    if [[ -n "$query" && -n "$fts_table" ]]; then
       sql="
 SELECT m.ts,
   ${user_name_expr} AS author,
@@ -1145,7 +1345,7 @@ JOIN ${msg_table} m ON ${fts_table}.rowid = m.rowid
 LEFT JOIN ${ch_dedup} c ON c.ID = m.CHANNEL_ID
 LEFT JOIN ${user_dedup} u ON u.ID = ${user_expr}
 WHERE ${fts_table} MATCH '${q_escaped}'"
-    else
+    elif [[ -n "$query" ]]; then
       sql="
 SELECT m.ts,
   ${user_name_expr} AS author,
@@ -1158,12 +1358,26 @@ FROM ${msg_table} m
 LEFT JOIN ${ch_dedup} c ON c.ID = m.CHANNEL_ID
 LEFT JOIN ${user_dedup} u ON u.ID = ${user_expr}
 WHERE m.${text_col} LIKE '%${q_escaped}%'"
+    else
+      # Author/channel-only search (e.g. from:jason with no keywords)
+      sql="
+SELECT m.ts,
+  ${user_name_expr} AS author,
+  COALESCE(c.NAME, m.CHANNEL_ID, '')                   AS channel,
+  m.${text_col} AS text_snippet,
+  m.${text_col} AS full_text,
+  '${ws}' AS workspace,
+  m.CHANNEL_ID AS channel_id
+FROM ${msg_table} m
+LEFT JOIN ${ch_dedup} c ON c.ID = m.CHANNEL_ID
+LEFT JOIN ${user_dedup} u ON u.ID = ${user_expr}
+WHERE 1=1"
     fi
 
     [[ -n "$channel_filter" ]] && \
       sql+=" AND (LOWER(COALESCE(c.NAME,'')) = LOWER('${channel_filter}') OR m.CHANNEL_ID = '${channel_filter}')"
     [[ -n "$author_filter" ]] && \
-      sql+=" AND (LOWER(COALESCE(u.USERNAME,'')) LIKE LOWER('%${author_filter}%'))"
+      sql+=" AND $(build_author_clause "$db" "$user_table" "$author_filter")"
 
     if $mine_filter; then
       local mine_clause
@@ -1194,7 +1408,11 @@ print(json.dumps(existing + new))
   done <<< "$workspaces"
 
   if ! $any_results; then
-    if $as_json; then echo "[]"; else info "No results for: ${query}"; fi
+    local display_q="$query"
+    [[ -n "$author_filter" ]] && display_q="from:${author_filter} ${display_q}"
+    [[ -n "$channel_filter" ]] && display_q="in:${channel_filter} ${display_q}"
+    display_q="${display_q%"${display_q##*[![:space:]]}"}"
+    if $as_json; then echo "[]"; else info "No results for: ${display_q:-<empty>}"; fi
     return
   fi
 
@@ -1245,12 +1463,35 @@ cmd_sql() {
   ensure_sqlite3
   init_dirs
 
-  local raw_sql="${1:-}"
-  local target_ws="${2:-}"
+  local raw_sql=""
+  local target_ws=""
+  local show_schema=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --workspace|-w) shift; target_ws="$1" ;;
+      --schema)       show_schema=true ;;
+      -)
+        [[ -n "$raw_sql" ]] && die "Unexpected argument: -"
+        raw_sql=$(cat)
+        ;;
+      -*)             die "Unknown sql option: $1" ;;
+      *)
+        [[ -z "$raw_sql" ]] && raw_sql="$1" || die "Unexpected argument: $1"
+        ;;
+    esac
+    shift
+  done
+
+  $show_schema && { cmd_schema "$target_ws"; return; }
 
   [[ "$raw_sql" == "-" ]] && raw_sql=$(cat)
-  [[ -z "$raw_sql" ]] && die "Usage: slackslaw sql 'SELECT ...' [workspace]
-  Or:    echo 'SELECT ...' | slackslaw sql -"
+  [[ -z "$raw_sql" ]] && die "Usage: slackslaw sql 'SELECT ...' [--workspace W]
+  Or:    echo 'SELECT ...' | slackslaw sql -
+  Or:    slackslaw sql --schema [--workspace W]   # print v4 schema cheat sheet
+  Or:    slackslaw schema [--workspace W]"
+
+  raw_sql=$(printf '%s' "$raw_sql" | normalize_sql)
 
   local workspaces
   if [[ -n "$target_ws" ]]; then
@@ -1274,7 +1515,70 @@ cmd_sql() {
     fi
 
     [[ "$ws_count" -gt 1 ]] && echo -e "\n${BOLD}${CYAN}Workspace: ${ws}${RESET}"
-    sqlite3 -column -header "$db" "$raw_sql" 2>&1 || warn "SQL error in workspace: $ws"
+    if ! sqlite3 -column -header "$db" "$raw_sql" 2>&1; then
+      warn "SQL error in workspace: $ws"
+      warn "Hint: slackdump v4 uses MESSAGE.TXT (not TEXT), S_USER (not USER), and message author via json_extract(CAST(m.DATA AS TEXT), '\$.user'). Run: slackslaw schema"
+    fi
+  done <<< "$workspaces"
+}
+
+cmd_schema() {
+  ensure_sqlite3
+  init_dirs
+
+  local target_ws=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --workspace|-w) shift; target_ws="$1" ;;
+      *)              [[ -z "$target_ws" ]] && target_ws="$1" ;;
+    esac
+    shift
+  done
+
+  local workspaces
+  if [[ -n "$target_ws" ]]; then
+    workspaces="$target_ws"
+  else
+    workspaces=$(list_configured_workspaces)
+  fi
+  [[ -z "$workspaces" ]] && die "No workspaces configured."
+
+  while IFS= read -r ws; do
+    [[ -z "$ws" ]] && continue
+    local ws_dir db
+    ws_dir=$(workspace_dir "$ws")
+    db=$(find_workspace_db "$ws_dir")
+    [[ -z "$db" || ! -f "$db" ]] && { warn "No DB for workspace '$ws'"; continue; }
+
+    local msg_table user_table ch_table text_col user_expr
+    msg_table=$(probe_table  "$db" MESSAGE messages message)
+    user_table=$(probe_table "$db" S_USER users user)
+    ch_table=$(probe_table "$db" CHANNEL channels)
+    text_col=$(probe_text_col "$db" "$msg_table")
+    user_expr=$(probe_user_expr "$db" "$msg_table")
+
+    header "Schema: ${ws}"
+    echo "  DB path     : ${db}"
+    echo "  msg table   : ${msg_table}.${text_col}  (message body)"
+    echo "  user table  : ${user_table}  (USERNAME + DATA JSON in v4)"
+    echo "  channel tbl : ${ch_table}"
+    echo "  author expr : ${user_expr}"
+    echo ""
+    echo "  Common columns (slackdump v4):"
+    sqlite3 -header -column "$db" \
+      "SELECT name AS table_name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY 1;" \
+      2>/dev/null || true
+    echo ""
+    echo "  Example — messages by author username:"
+    echo "    SELECT datetime(CAST(m.TS AS REAL), 'unixepoch') AS dt, m.${text_col}"
+    echo "    FROM ${msg_table} m"
+    echo "    JOIN (SELECT ID, USERNAME FROM ${user_table} GROUP BY ID) u"
+    echo "      ON u.ID = ${user_expr}"
+    echo "    WHERE u.USERNAME = 'jason.tunstall'"
+    echo "    ORDER BY CAST(m.TS AS REAL) DESC LIMIT 20;"
+    echo ""
+    echo "  Example — search with inline author filter:"
+    echo "    slackslaw search 'from:jason.tunstall new joiner'"
   done <<< "$workspaces"
 }
 
@@ -2883,7 +3187,8 @@ ${BOLD}COMMANDS${RESET}
   ${CYAN}keywords${RESET} remove <word>       Remove a keyword
   ${CYAN}sync${RESET} [--full]                Sync workspaces (incremental by default)
   ${CYAN}sync${RESET} --workspace <n>         Sync a single workspace
-  ${CYAN}sync${RESET} --channel "#name"       Sync a single channel
+  ${CYAN}sync${RESET} --channel "#name"       Sync one or more channels (comma-sep ok)
+  ${CYAN}sync${RESET} --filter-channels <path>  Full sync, but filter channels via file (DMs still included)
   ${CYAN}sync${RESET} --since 30d             Only sync messages from the last 30d/24h/etc
   ${CYAN}sync${RESET} --quiet                 Cron-friendly: suppress output, exit 0/1
   ${CYAN}whatsnew${RESET}    (alias: new)     Messages received since the last sync
@@ -2894,7 +3199,8 @@ ${BOLD}COMMANDS${RESET}
   ${CYAN}search${RESET} "expr"                Full-text search across all workspaces
   ${CYAN}search${RESET} "expr" --workspace W  Limit to one workspace
   ${CYAN}search${RESET} "expr" --channel C    Limit to channel (# prefix optional)
-  ${CYAN}search${RESET} "expr" --author A     Limit to author name
+  ${CYAN}search${RESET} "expr" --author A     Limit to author name (or use from:USER / author:USER in expr)
+  ${CYAN}search${RESET} "from:alice deploy"  Inline author filter (also in:, channel:)
   ${CYAN}search${RESET} "expr" --mine         Only threads I'm in
   ${CYAN}search${RESET} "expr" --after 7d     Only messages after date/duration
   ${CYAN}search${RESET} "expr" --before DATE  Only messages before date/duration
@@ -2918,6 +3224,9 @@ ${BOLD}COMMANDS${RESET}
   ${CYAN}repair${RESET}                       Check database integrity
   ${CYAN}sql${RESET} 'SELECT ...'             Run raw SQL against the archive DB(s)
   ${CYAN}sql${RESET} -                        Read SQL from stdin
+  ${CYAN}sql${RESET} --workspace W            Limit SQL to one workspace
+  ${CYAN}schema${RESET} [--workspace W]       Print slackdump v4 schema cheat sheet
+  ${CYAN}sql${RESET} --schema                 Alias for schema
   ${CYAN}status${RESET}                       Archive stats per workspace
   ${CYAN}doctor${RESET}                       Check config, deps, and DB health
 
@@ -2989,6 +3298,7 @@ main() {
     unread)            cmd_unread     "$@" ;;
     search)            cmd_search     "$@" ;;
     sql)               cmd_sql        "$@" ;;
+    schema)            cmd_schema     "$@" ;;
     status)            cmd_status     "$@" ;;
     stats)             cmd_stats      "$@" ;;
     threads|thread)    cmd_threads    "$@" ;;

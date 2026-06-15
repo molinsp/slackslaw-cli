@@ -67,6 +67,8 @@ slackslaw search "quarterly roadmap"
 
 # Search with filters
 slackslaw search "deploy" --channel "#engineering" --author alice --limit 50
+slackslaw search "from:jason.tunstall new joiner"   # inline author filter
+slackslaw search "in:team-all-product deploy"       # inline channel filter
 
 # JSON output for piping
 slackslaw search "bug report" --json
@@ -79,6 +81,8 @@ slackslaw export --channel "#general" > general.md
 
 # Raw SQL
 slackslaw sql 'SELECT * FROM MESSAGE LIMIT 10'
+slackslaw sql 'SELECT USERNAME FROM USER' --workspace dialecticanet   # USER→S_USER alias
+slackslaw schema [--workspace dialecticanet]                          # v4 schema cheat sheet
 
 # Detailed archive statistics
 slackslaw stats
@@ -104,7 +108,7 @@ slackslaw ask "what was discussed about the deployment?"
 | `sync --since 30d` | Time-bounded sync |
 | `whatsnew` | Print messages since last sync (`--mine`, `--json`) |
 | `unread` | Show unread messages (`--json`) |
-| `search "expr"` | Full-text search with `--channel`, `--author`, `--after`, `--before`, `--newest-first`, `--limit` |
+| `search "expr"` | Full-text search with `--channel`, `--author`, `--after`, `--before`, `--newest-first`, `--limit`. Inline modifiers: `from:USER`, `author:USER`, `in:CHANNEL`, `channel:CHANNEL` |
 | `threads <url>` | Dump an entire thread by Slack URL (`--json`) |
 | `stats` | Detailed statistics (top senders, busiest channels, active hours) |
 | `export --channel "#name"` | Export channel to markdown or HTML (`--format html`, `--output file`) |
@@ -112,7 +116,8 @@ slackslaw ask "what was discussed about the deployment?"
 | `context --since 7d` | LLM-ready JSON context dump |
 | `ask "question"` | RAG over the archive (`--provider openai` for OpenAI) |
 | `mcp` | Start MCP server (wraps slackdump mcp) |
-| `sql 'SELECT ...'` | Raw SQL against local databases |
+| `sql 'SELECT ...'` | Raw SQL against local databases (`--workspace W`; auto-fixes `USER`→`S_USER`, `m.TEXT`→`m.TXT`) |
+| `schema` | Print slackdump v4 schema cheat sheet for hand-written SQL |
 | `status` | Archive stats per workspace |
 | `gc` | Garbage collect (VACUUM databases) |
 | `repair` | Check database integrity |
